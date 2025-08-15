@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Leaflet Export</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+      html, body, #map { height: 100%; margin: 0; }
+
+      .swatch{
+        display:inline-block; width:12px; height:12px; margin:0 6px 0 4px;
+        border:1px solid rgba(0,0,0,.25); border-radius:2px;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.3);
+        vertical-align:middle;
+      }
+
+      .leaflet-control-layers-overlays label input:not(:checked) ~ span { opacity:.45; }
+    </style>
+    {{PRELOAD_SCRIPTS}}
+  </head>
+  <body>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+      (async () => {
+        const basemapDefs = [
+          {
+            name: "OpenStreetMap",
+            url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            opts: { maxZoom: 22, attribution: "&copy; OpenStreetMap" },
+          },
+          {
+            name: "Carto Light",
+            url: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+            opts: { maxZoom: 22, attribution: "&copy; OpenStreetMap &copy; CARTO" },
+          },
+          {
+            name: "Carto Dark",
+            url: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+            opts: { maxZoom: 22, attribution: "&copy; OpenStreetMap &copy; CARTO" },
+          },
+          {
+            name: "World Imagery",
+            url: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            opts: { maxZoom: 20, attribution: "Map tiles by Stamen; Data &copy; OpenStreetMap" },
+          },
+          {
+            name: "Selected (default)",
+            url: "{{BASEMAP_URL}}",
+            opts: { maxZoom: 22 },
+          },
+        ];
+
+        const baseLayers = {};
+        let defaultBase = null;
+        basemapDefs.forEach((def) => {
+          const layer = L.tileLayer(def.url, def.opts || {});
+          baseLayers[def.name] = layer;
+          if (def.url === "{{BASEMAP_URL}}") defaultBase = layer;
+        });
+        if (!defaultBase) defaultBase = Object.values(baseLayers)[0];
+
+        const map = L.map("map", {
+          preferCanvas: true,
+          layers: [defaultBase],
+        }).setView([0, 0], 2);
+
+        const ctrl = L.control
+          .layers(baseLayers, {}, { collapsed: false, position: "topright" })
+          .addTo(map);
+
+        const colorForIndex = (i) => {
+          const h = (i * 137.508) % 360;
+          return { fill: `hsl(${h},70%,55%)`, stroke: `hsl(${h},70%,35%)` };
+        };
+
+        const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        function overlayLabelHtml(type, colors, name){
+          const bg = (type === 'line') ? colors.stroke : colors.fill;
+          const bc = colors.stroke;
+          return `<span><span class="swatch" style="background:${bg};border-color:${bc};"></span>${esc(name)}</span>`;
+        }
+
+        const manifest =
+          window.__manifest ||
+          (await fetch("{{MANIFEST_URL}}").then((r) => r.json()));
+
+        let bb = null;
+
+        manifest.layers.forEach(async (lyr, idx) => {
+          const { fill, stroke } = colorForIndex(idx);
+
+          let gj = window.__layers && window.__layers[lyr.key];
+          if (!gj && lyr.path) {
+            try {
+              gj = await fetch(lyr.path).then((r) => r.json());
+            } catch {
+              console.warn("Failed to load", lyr.path);
+              return;
+            }
+          }
+          if (!gj) return;
+
+          const layer = L.geoJSON(gj, {
+            style: (f) => {
+              const t = ((f.geometry && f.geometry.type) || "").toLowerCase();
+              if (t.includes("line"))
+                return { color: stroke, weight: 2, opacity: 0.9 };
+              if (t.includes("polygon"))
+                return {
+                  color: stroke,
+                  weight: 1,
+                  fillColor: fill,
+                  fillOpacity: 0.35,
+                  opacity: 0.9,
+                };
+              return {};
+            },
+            pointToLayer: (f, latlng) =>
+              L.circleMarker(latlng, {
+                radius: 4,
+                color: stroke,
+                weight: 1,
+                opacity: 0.9,
+                fillColor: fill,
+                fillOpacity: 0.6,
+              }),
+            onEachFeature: (f, l) => {
+              const p = (f && f.properties) || {};
+              const html = Object.keys(p)
+                .map((k) => `<b>${k}:</b> ${p[k]}`)
+                .join("<br>");
+              if (html) l.bindPopup(html);
+            },
+          }).addTo(map);
+
+          const name = lyr.name || `Layer ${idx + 1}`;
+          const gtype = (lyr.geometryType || "").toLowerCase();
+          const legendType = gtype.includes("point") ? "point" : gtype.includes("line") ? "line" : "polygon";
+
+          ctrl.addOverlay(layer, overlayLabelHtml(legendType, { fill, stroke }, name)); 
+
+          if (lyr.bounds) {
+            const b = L.latLngBounds([
+              [lyr.bounds[1], lyr.bounds[0]],
+              [lyr.bounds[3], lyr.bounds[2]],
+            ]);
+            bb = bb ? bb.extend(b) : b;
+            map.fitBounds(bb, { padding: 20 });
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

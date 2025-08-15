@@ -1,0 +1,230 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>OpenLayers Export</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@latest/dist/ol.css">
+
+  <style>
+    html, body, #map { height:100%; margin:0; }
+    .ui { position:absolute; top:10px; right:10px; z-index:1000; display:flex; gap:10px; }
+    .panel { background:#fff; padding:10px 12px; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,.25);
+             font:12px/1.2 system-ui,sans-serif; max-height:60vh; overflow:auto; }
+    .panel h4 { margin:0 0 8px; font-size:12px; }
+    .panel label { display:flex; align-items:center; gap:6px; margin:4px 0; }
+    .ol-popup { position:absolute; background:#fff; padding:8px 10px; border-radius:8px;
+                border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,.2); min-width:180px; z-index:1000; }
+    .ol-popup-closer { position:absolute; top:4px; right:6px; text-decoration:none; }
+
+    .swatch{
+      width:12px; height:12px; border-radius:2px;
+      border:1px solid rgba(0,0,0,.25);
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.4);
+      flex:0 0 auto;
+    }
+    .panel label.dim { opacity:.45; }
+
+    .ol-popup-closer { position:absolute; top:4px; right:6px; text-decoration:none; }
+  </style>
+
+  {{PRELOAD_SCRIPTS}} 
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/ol@latest/dist/ol.js"></script>
+
+<script>
+(() => {
+  const {Map, View, Overlay} = ol;
+  const {Tile: TileLayer, Vector: VectorLayer, Group: LayerGroup} = ol.layer;
+  const {XYZ, Vector: VectorSource} = ol.source;
+  const {GeoJSON} = ol.format;
+  const {Fill, Stroke, Style, Circle: CircleStyle} = ol.style;
+  const {fromLonLat, transform} = ol.proj;
+  const {extend, createEmpty} = ol.extent;
+
+  const basemapDefs = [
+    { name: 'OpenStreetMap', url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' },
+    { name: 'Carto Light',   url: 'https://{a-c}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png' },
+    { name: 'Carto Dark',    url: 'https://{a-c}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png' },
+    { name: 'Selected (default)', url: '{{BASEMAP_URL}}' }
+  ];
+  const basemapLayers = basemapDefs.map(def =>
+    new TileLayer({ title:def.name, type:'base', visible:false, source:new XYZ({url:def.url}) })
+  );
+  (basemapLayers.find((_,i)=>basemapDefs[i].url==='{{BASEMAP_URL}}')||basemapLayers[0]).setVisible(true);
+  const baseGroup = new LayerGroup({ layers: basemapLayers });
+
+  const map = new Map({ target:'map', layers:[baseGroup], view:new View({ center: fromLonLat([0,0]), zoom: 2 }) });
+
+  const ui = document.createElement('div'); ui.className='ui';
+  const basePanel = document.createElement('div'); basePanel.className='panel'; basePanel.innerHTML='<h4>Basemap</h4>';
+  const overlayPanel = document.createElement('div'); overlayPanel.className='panel'; overlayPanel.innerHTML='<h4>Layers</h4>';
+  ui.appendChild(basePanel); ui.appendChild(overlayPanel); document.body.appendChild(ui);
+  basemapLayers.forEach((layer,i)=>{
+    const row=document.createElement('label'), rb=document.createElement('input'); rb.type='radio'; rb.name='basemap'; rb.checked=layer.getVisible();
+    rb.onchange=()=>{ basemapLayers.forEach(l=>l.setVisible(false)); layer.setVisible(true); };
+    row.appendChild(rb); row.appendChild(document.createTextNode(basemapDefs[i].name)); basePanel.appendChild(row);
+  });
+
+  const hue = i => (i*137.508)%360;
+ 
+  const strokeColor = i => `hsl(${hue(i)},70%,35%)`;          
+  const fillColor   = i => `hsla(${hue(i)},70%,55%,0.35)`;    
+  const pointColor  = i => `hsl(${hue(i)},70%,55%)`;          
+
+  const styleFor = i => new Style({                           
+    stroke:new Stroke({color:strokeColor(i),width:1.5}),      
+    fill:new Fill({color:fillColor(i)})                       
+  });
+  const pointStyleFor = i => new Style({                      
+    image:new CircleStyle({                                   
+      radius:4,                                               
+      fill:new Fill({color:pointColor(i)}),                   
+      stroke:new Stroke({color:strokeColor(i),width:1})       
+    })
+  });
+
+  const manifest = window.__manifest || null;
+  const getManifest = manifest
+    ? Promise.resolve(manifest)
+    : ( '{{MANIFEST_URL}}'.includes('{{')
+        ? Promise.resolve({layers:[]})
+        : fetch('{{MANIFEST_URL}}').then(r=>r.json()).catch(()=>({layers:[]})) );
+
+  getManifest.then(async (man) => {
+    const overlayLayers = [];
+    const all = createEmpty();
+    let anyBounds = false;
+
+    const layers = Array.isArray(man.layers) ? man.layers : [];
+
+    for (let i = 0; i < layers.length; i++) {
+      const lyr = layers[i];
+
+      let gj = (window.__layers && window.__layers[lyr.key]) || null;
+      if (!gj && lyr.path) {
+        try { gj = await fetch(lyr.path).then(r => r.json()); }
+        catch (e) { console.warn('Load failed', lyr.path, e); continue; }
+      }
+      if (!gj) continue;
+
+      const src = new VectorSource({
+        features: new GeoJSON().readFeatures(gj, { featureProjection: 'EPSG:3857' })
+      });
+
+      const geomType = (lyr.geometryType || '').toLowerCase();               
+      const isPoint  = geomType.includes('point');                           
+      const isLine   = geomType.includes('line');                             
+
+      //const isPoint = (lyr.geometryType || '').toLowerCase().includes('point');
+      const v = new VectorLayer({
+        source: src,
+        style: isPoint ? pointStyleFor(i) : styleFor(i),
+        visible: true,
+        title: lyr.label || lyr.name || `Layer ${i+1}`
+      });
+
+      v.set('legend', { type: isPoint ? 'point' : (isLine ? 'line' : 'polygon'), index: i });
+
+      map.addLayer(v);
+      overlayLayers.push(v);
+
+      if (lyr.bounds && lyr.bounds.length === 4) {
+        const bl = transform([lyr.bounds[0],lyr.bounds[1]], 'EPSG:4326', 'EPSG:3857');
+        const tr = transform([lyr.bounds[2],lyr.bounds[3]], 'EPSG:4326', 'EPSG:3857');
+        extend(all, [bl[0], bl[1], tr[0], tr[1]]);
+        anyBounds = true;
+      }
+    }
+
+    overlayLayers.forEach(layer=>{
+      const row=document.createElement('label');
+      const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=layer.getVisible();
+
+      const sw=document.createElement('span'); sw.className='swatch';           
+      const legend = layer.get('legend') || {};                                 
+      const t = legend.type || 'polygon';                                       
+      const idx = legend.index ?? 0;                                            
+
+      if (t === 'point') {                                                      
+        sw.style.backgroundColor = pointColor(idx);                             
+        sw.style.borderColor     = strokeColor(idx);                            
+      } else if (t === 'line') {                                                
+        sw.style.backgroundColor = strokeColor(idx);                            
+        sw.style.borderColor     = strokeColor(idx);                            
+      } else {                                                                  
+        sw.style.backgroundColor = fillColor(idx);                              
+        sw.style.borderColor     = strokeColor(idx);                            
+      }                                                                         
+
+      cb.onchange=()=>{ layer.setVisible(cb.checked); row.classList.toggle('dim', !cb.checked); }; 
+
+      row.appendChild(cb);
+      row.appendChild(sw);                                                      
+      row.appendChild(document.createTextNode(layer.get('title')||'Layer'));
+      if (!layer.getVisible()) row.classList.add('dim');                        
+      overlayPanel.appendChild(row);
+    });
+
+    if (anyBounds && Number.isFinite(all[0]) && all[0] < all[2]) {
+      map.getView().fit(all, { padding:[20,20,20,20] });
+    }
+  });
+
+  const popupEl=document.createElement('div'); popupEl.className='ol-popup';
+  const closer=document.createElement('a'); closer.href='#'; closer.className='ol-popup-closer'; closer.textContent='✕';
+  const content=document.createElement('div');
+  popupEl.appendChild(closer); popupEl.appendChild(content);
+
+  const pop=new Overlay({ element: popupEl, autoPan: { animation: { duration: 250 } } });
+  map.addOverlay(pop); 
+
+  closer.onclick=()=>{ pop.setPosition(undefined); closer.blur(); return false; };
+
+  const formatVal = (v) => {
+    if (v == null) return '';
+    if (typeof v === 'object') {
+      try { return JSON.stringify(v); } catch { return String(v); }
+    }
+    return String(v);
+  };
+
+  map.on('singleclick', (evt) => {
+    const rows = [];
+
+    map.forEachFeatureAtPixel(
+      evt.pixel,
+      (feat, layer) => {
+        const props = { ...feat.getProperties() };
+        delete props.geometry;
+        for (const [k, v] of Object.entries(props)) {
+          rows.push(`<div><b>${k}:</b> ${formatVal(v)}</div>`);
+        }
+      },
+      {
+        hitTolerance: 6,
+        layerFilter: (l) => l instanceof ol.layer.Vector
+      }
+    );
+
+    if (rows.length) {
+      content.innerHTML = rows.join('');
+      pop.setPosition(evt.coordinate);
+    } else {
+      pop.setPosition(undefined);
+    }
+  });
+
+  map.on('pointermove', (evt) => {
+    const hit = map.hasFeatureAtPixel(evt.pixel, { hitTolerance: 6, layerFilter: (l) => l instanceof ol.layer.Vector });
+    map.getTargetElement().style.cursor = hit ? 'pointer' : '';
+  });
+})();
+</script>
+
+</body>
+</html>
