@@ -6,7 +6,7 @@
 name=Interactive Map
 qgisMinimumVersion=3.0
 description=Bringing interactive maps to QGIS
-version=0.1
+version=0.2
 author=Kofi Agyekum
 email=adukofi73@yahoo.com
 
