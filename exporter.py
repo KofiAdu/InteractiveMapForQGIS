@@ -34,8 +34,7 @@ class Exporter:
     def export_to_web_map(self, settings):
         print("Starting export with settings:", settings)
 
-      
-        engine = settings["engine"]  #Leaflet, Openlayer or Mapbox
+        engine = settings["engine"]  # Leaflet, Openlayer or Mapbox
         tpl_path = os.path.join(self.plugin_dir, "templates", f"{engine.lower()}_template.html")
         if not os.path.exists(tpl_path):
             self.iface.messageBar().pushCritical("Export Error", f"Missing template: {tpl_path}")
@@ -44,22 +43,37 @@ class Exporter:
 
         basemap_url = self.get_basemap_url(settings)
 
-        file_url_mode = bool(settings.get("file_url_mode", True))  
+        def _as_bool(v, default=True):
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return default
+            return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-        #cap size for leaflet 
+        file_url_mode = _as_bool(settings.get("file_url_mode", True))
+
+        ##caps
         LEAFLET_MAX_MB_DEFAULT = 350
         leaflet_max_mb = int(settings.get("leaflet_max_mb", LEAFLET_MAX_MB_DEFAULT))
         leaflet_max_bytes = leaflet_max_mb * 1024 * 1024
 
-        
-        MAX_JS_WRAP_MB_DEFAULT = 250  
+        MAX_JS_WRAP_MB_DEFAULT = 250
         max_js_wrap_mb = int(settings.get("max_js_wrap_mb", MAX_JS_WRAP_MB_DEFAULT))
         max_js_wrap_bytes = max_js_wrap_mb * 1024 * 1024
 
-        #output folders
+        # output folders
         out_dir = (settings.get("output_folder") or "").strip() or os.path.join(os.path.expanduser("~"), "InteractiveMap_Export")
         data_dir = os.path.join(out_dir, "data")
-        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+       
+        if os.path.isdir(data_dir):
+            for fn in os.listdir(data_dir):
+                try:
+                    os.remove(os.path.join(data_dir, fn))
+                except Exception:
+                    pass
+        else:
+            os.makedirs(data_dir, exist_ok=True)
 
         #crs conversion setup
         dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -67,21 +81,25 @@ class Exporter:
 
         manifest = {"layers": []}
         exported_any = False
-        preload_scripts = [] 
-        skipped_large = []   
-        skipped_offline = []  
+        preload_scripts = []
+        skipped_large = []
+        skipped_offline = []
 
-        #export each vector layer
+        kind_map = {
+            QgsWkbTypes.PointGeometry:   "point",
+            QgsWkbTypes.LineGeometry:    "line",
+            QgsWkbTypes.PolygonGeometry: "polygon",
+        }
+
         for layer in QgsProject.instance().mapLayers().values():
             if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
                 continue
 
-            safe = self._safe_name(layer.name())
+            safe_base = self._safe_name(layer.name()) or "layer"
+            safe = f"{safe_base}-{layer.id()[:6]}"
             print("→ exporting", layer.name(), "→", safe)
 
-            # temp GeoJSON in EPSG:4326 (RFC7946-friendly)
             tmp_path = os.path.join(tempfile.gettempdir(), f"{layer.id()}.geojson")
-
             opt = QgsVectorFileWriter.SaveVectorOptions()
             opt.driverName   = "GeoJSON"
             opt.fileEncoding = "UTF-8"
@@ -91,28 +109,28 @@ class Exporter:
             err_code, err_msg = QgsVectorFileWriter.writeAsVectorFormatV2(layer, tmp_path, ctx, opt)
             print("writer-return →", layer.name(), err_code, err_msg)
             if err_code != QgsVectorFileWriter.NoError:
-                print("⚠️  write error, skipped:", layer.name(), "| reason:", err_msg)
+                print("write error, skipped:", layer.name(), "| reason:", err_msg)
                 continue
 
             size_bytes = os.path.getsize(tmp_path)
 
             if engine == "Leaflet" and size_bytes > leaflet_max_bytes:
                 skipped_large.append((layer.name(), size_bytes))
-                print(f"⏭️  Skipping '{layer.name()}' – {size_bytes/1024/1024:.1f} MB exceeds Leaflet limit ({leaflet_max_mb} MB).")
+                print(f"Skipping '{layer.name()}' – {size_bytes/1024/1024:.1f} MB exceeds Leaflet limit ({leaflet_max_mb} MB).")
                 continue
 
+            preload_this = True
             if file_url_mode and size_bytes > max_js_wrap_bytes:
                 skipped_offline.append((layer.name(), size_bytes))
-                print(f"⏭️  Skipping '{layer.name()}' – {size_bytes/1024/1024:.1f} MB exceeds offline JS-wrap limit ({max_js_wrap_mb} MB).")
-                continue
+                print(f"Skipping JS-wrap for '{layer.name()}' – {size_bytes/1024/1024:.1f} MB exceeds offline JS-wrap limit ({max_js_wrap_mb} MB).")
+                preload_this = False  
 
             out_geojson = os.path.join(data_dir, f"{safe}.geojson")
             shutil.copyfile(tmp_path, out_geojson)
 
-            # layer metadata
             ext = layer.extent()
             bounds = [ext.xMinimum(), ext.yMinimum(), ext.xMaximum(), ext.yMaximum()]
-            gtype = QgsWkbTypes.displayString(layer.wkbType())
+            geom_kind = kind_map.get(QgsWkbTypes.geometryType(layer.wkbType()), "other")
 
             manifest["layers"].append({
                 "id": layer.id(),
@@ -120,12 +138,13 @@ class Exporter:
                 "name": layer.name(),
                 "type": "geojson",
                 "path": f"data/{safe}.geojson",
-                "geometryType": gtype,
+                "geometryType": QgsWkbTypes.displayString(layer.wkbType()),
+                "geometryKind": geom_kind,
                 "bounds": bounds
             })
             exported_any = True
 
-            if file_url_mode:
+            if file_url_mode and preload_this:
                 js_path = os.path.join(data_dir, f"{safe}.js")
                 with open(out_geojson, "r", encoding="utf-8") as f:
                     gj = f.read()
@@ -139,13 +158,13 @@ class Exporter:
         def _fmt_mb(n): return f"{n/1024/1024:.1f} MB"
 
         if skipped_large:
-            msg = "Skipped (too large for Leaflet): " + ", ".join([f"{n} ({_fmt_mb(b)})" for n,b in skipped_large])
+            msg = "Skipped (too large for Leaflet): " + ", ".join([f"{n} ({_fmt_mb(b)})" for n, b in skipped_large])
             self.iface.messageBar().pushWarning("Leaflet limit", msg)
 
         if skipped_offline:
-            msg = ("Skipped for offline (double-click) mode: " +
-                ", ".join([f"{n} ({_fmt_mb(b)})" for n,b in skipped_offline]) +
-                f". Tip: switch engine (OpenLayers/Mapbox) or lower size, or serve via http.")
+            msg = ("Skipped JS-wrap for offline (double-click) mode: " +
+                ", ".join([f"{n} ({_fmt_mb(b)})" for n, b in skipped_offline]) +
+                f". Tip: serve via http or raise the offline cap ({max_js_wrap_mb} MB) if needed.")
             self.iface.messageBar().pushInfo("Offline limit", msg)
 
         if not exported_any:
@@ -168,11 +187,11 @@ class Exporter:
         style_url = self.get_mapbox_style_url(settings)
         token = settings.get("token", "")
         html = (template
-            .replace("{{BASEMAP_URL}}", basemap_url or "")
-            .replace("{{MANIFEST_URL}}", manifest_url)
-            .replace("{{PRELOAD_SCRIPTS}}", "\n  ".join(preload_scripts))
-            .replace("{{MAPBOX_TOKEN}}", token)
-            .replace("{{MAPBOX_STYLE}}", style_url or ""))
+                .replace("{{BASEMAP_URL}}", basemap_url or "")
+                .replace("{{MANIFEST_URL}}", manifest_url)
+                .replace("{{PRELOAD_SCRIPTS}}", "\n  ".join(preload_scripts))
+                .replace("{{MAPBOX_TOKEN}}", token)
+                .replace("{{MAPBOX_STYLE}}", style_url or ""))
 
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{engine.lower()}_map.html")
@@ -184,6 +203,7 @@ class Exporter:
         except Exception as e:
             self.iface.messageBar().pushCritical("Export Failed", str(e))
             print("Failed to write HTML:", e)
+
 
 
     def _safe_name(self, s: str) -> str:

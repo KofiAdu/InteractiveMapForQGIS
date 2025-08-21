@@ -24,8 +24,11 @@
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import QAction
-from qgis.core import QgsVectorLayer, QgsProject
+from qgis.core import ( QgsVectorLayer, QgsProject, QgsSingleSymbolRenderer, 
+                       QgsCategorizedSymbolRenderer, QgsGraduatedSymbolRenderer, 
+                       QgsRuleBasedRenderer, QgsMarkerSymbol, QgsLineSymbol, QgsFillSymbol)
 from qgis.PyQt.QtWidgets import QMessageBox, QFileDialog
+from osgeo import ogr
 from qgis.utils import plugins, iface
 
 # Initialize Qt resources from file resources.py
@@ -235,51 +238,104 @@ class InteractiveMap:
             self.iface.mainWindow(),
             "Select Vector Layer(s)",
             "",
-            "Vector Files (*.shp *.geojson *.gpkg *.json);;All Files (*)"
+            "Vector Files (*.shp *.geojson *.gpkg *.json *.kml *.kmz);;All Files (*)"
         )
-
         if not file_paths:
             return
 
-        # Ensure tracking list is initialized
         if not hasattr(self, 'loaded_vector_layers'):
             self.loaded_vector_layers = []
 
         def random_color():
             return QColor(random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
 
-        for file_path in file_paths:
-            layer_name = os.path.basename(file_path)
-            layer = QgsVectorLayer(file_path, layer_name, "ogr")
+        def apply_simple_symbology(layer: QgsVectorLayer):
+            """Only tweak when single-symbol; leave categorized/graduated/rule-based alone."""
+            try:
+                renderer = layer.renderer()
+                geom = layer.geometryType()  
 
-            if not layer.isValid():
+                if isinstance(renderer, QgsSingleSymbolRenderer):
+                    sym = renderer.symbol()
+                    if geom == 0:
+                        sym.setSize(4)
+                        sym.setColor(random_color())
+                    elif geom == 1:
+                        sym.setWidth(1.5)
+                        sym.setColor(random_color())
+                    elif geom == 2:
+                        sym.setColor(random_color())
+                        sym.setOpacity(0.6)
+                    layer.triggerRepaint()
+                else:
+                    pass
+            except Exception as e:
+                QMessageBox.warning(self.iface.mainWindow(), "Styling warning",
+                                    f"Could not style '{layer.name()}': {e}")
+
+        def load_gpkg_layers(gpkg_path: str) -> int:
+            """Open a GeoPackage and load all vector sublayers."""
+            loaded = 0
+            try:
+                ds = ogr.Open(gpkg_path)
+                if ds is None:
+                    QMessageBox.warning(self.iface.mainWindow(), "Load Error",
+                                        f"Could not open GeoPackage: {os.path.basename(gpkg_path)}")
+                    return 0
+
+                for i in range(ds.GetLayerCount()):
+                    ogr_lyr = ds.GetLayerByIndex(i)
+                    if ogr_lyr is None:
+                        continue
+                    name = ogr_lyr.GetName() or f"layer_{i}"
+                    uri = f"{gpkg_path}|layername={name}"
+                    v = QgsVectorLayer(uri, name, "ogr")
+                    if not v.isValid():
+                        print(f"Failed to load sublayer '{name}' from {gpkg_path}")
+                        continue
+
+                    QgsProject.instance().addMapLayer(v)
+                    self.loaded_vector_layers.append(v)
+                    apply_simple_symbology(v)
+                    print(f"Loaded GPKG sublayer: {name}")
+                    loaded += 1
+            except Exception as e:
+                QMessageBox.warning(self.iface.mainWindow(), "GeoPackage Error",
+                                    f"Problem reading {os.path.basename(gpkg_path)}:\n{e}")
+            return loaded
+
+        total_loaded = 0
+        for file_path in file_paths:
+            ext = os.path.splitext(file_path)[1].lower()
+
+            if ext == ".gpkg":
+                loaded = load_gpkg_layers(file_path)
+                total_loaded += loaded
+                if loaded == 0:
+                    print(f"ℹNo layers loaded from {file_path}")
+                continue
+
+            layer_name = os.path.basename(file_path)
+            v = QgsVectorLayer(file_path, layer_name, "ogr")
+            if not v.isValid():
                 QMessageBox.warning(self.iface.mainWindow(), "Error", f"Failed to load: {layer_name}")
                 continue
 
-            # Apply basic symbology
-            symbol = layer.renderer().symbol()
-            geometry_type = layer.geometryType()
+            QgsProject.instance().addMapLayer(v)
+            self.loaded_vector_layers.append(v)
+            apply_simple_symbology(v)
+            print(f"Loaded: {v.name()}")
+            total_loaded += 1
 
-            if geometry_type == 0:
-                symbol.setSize(4)
-                symbol.setColor(random_color())
-            elif geometry_type == 1:
-                symbol.setWidth(1.5)
-                symbol.setColor(random_color())
-            elif geometry_type == 2:
-                symbol.setColor(random_color())
-                symbol.setOpacity(0.6)
-
-            # Add to map and track
-            QgsProject.instance().addMapLayer(layer)
-            self.loaded_vector_layers.append(layer)
-            print(f"✅ Tracked vector layer: {layer.name()}")
-
-        QMessageBox.information(self.iface.mainWindow(), "Layers Loaded", f"Successfully loaded {len(file_paths)} layer(s).")
+        if total_loaded:
+            QMessageBox.information(self.iface.mainWindow(), "Layers Loaded",
+                                    f"Successfully loaded {total_loaded} layer(s).")
+        else:
+            QMessageBox.warning(self.iface.mainWindow(), "No Layers Loaded",
+                                "Nothing was loaded. If this was a GeoPackage, it may be empty or unreadable.")
 
 
     def export_to_web_map(self):
-        # Open the qgis2web GUI dialog pre-loaded with current project
         try:
             dlg = MainDialog(self.iface)
             dlg.show()
