@@ -6,7 +6,7 @@
 name=Interactive Map
 qgisMinimumVersion=3.0
 description=Bringing interactive maps to QGIS
-version=0.2
+version=0.3
 author=Kofi Agyekum
 email=adukofi73@yahoo.com
 
@@ -20,7 +20,7 @@ repository=https://github.com/KofiAdu/InteractiveMapForQGIS
 
 hasProcessingProvider=no
 # Uncomment the following line and add your changelog:
-changelog=Updated plugin version to 0.2, fixed geopackage load error
+changelog=Fix Mapbox export. Correctly displays multi-layer GeoPackages and restores feature popups.
 
 # Tags are comma separated with spaces allowed
 tags=python

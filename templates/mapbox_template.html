@@ -62,6 +62,49 @@
           if (beforeId) map.moveLayer("basemap", beforeId);
         }
 
+        function firstLabelLayerId() {
+          const layers = map.getStyle().layers || [];
+          for (const l of layers) {
+            if (l.type === 'symbol' && l.layout && l.layout['text-field']) return l.id;
+          }
+          return undefined;
+        }
+
+        function isLonLatBounds(b) {
+          if (!Array.isArray(b) || b.length !== 4) return false;
+          const [minx, miny, maxx, maxy] = b.map(Number);
+          return (
+            Number.isFinite(minx) && Number.isFinite(miny) &&
+            Number.isFinite(maxx) && Number.isFinite(maxy) &&
+            minx >= -180 && maxx <= 180 && miny >= -90 && maxy <= 90 &&
+            minx <= maxx && miny <= maxy
+          );
+        }
+        function bboxFromGeoJSON(gj) {
+          const fc = (gj?.type === "FeatureCollection") ? gj :
+                     (gj?.type === "Feature") ? { type:"FeatureCollection", features:[gj] } :
+                     { type:"FeatureCollection", features:[] };
+          let minx=Infinity, miny=Infinity, maxx=-Infinity, maxy=-Infinity;
+          const walk = (c) => {
+            if (!Array.isArray(c)) return;
+            if (typeof c[0] === "number" && typeof c[1] === "number") {
+              const x=c[0], y=c[1];
+              if (Number.isFinite(x) && Number.isFinite(y)) {
+                if (x<minx) minx=x; if (y<miny) miny=y;
+                if (x>maxx) maxx=x; if (y>maxy) maxy=y;
+              }
+            } else { for (const ci of c) walk(ci); }
+          };
+          for (const f of fc.features) {
+            const g = f?.geometry; if (!g) continue;
+            if (g.type === "GeometryCollection") (g.geometries||[]).forEach(gg => walk(gg.coordinates));
+            else walk(g.coordinates);
+          }
+          if (minx === Infinity) return null;
+          const out = [minx,miny,maxx,maxy];
+          return isLonLatBounds(out) ? out : null;
+        }
+
         const ui = document.createElement("div");
         ui.className = "ui";
         const overlayPanel = document.createElement("div");
@@ -148,24 +191,37 @@
           className: "popup",
         });
 
+        function bindPopupsAndCursor(layerIds) {
+          layerIds.forEach(id => {
+            if (!map.getLayer(id)) return;
+            map.on("mouseenter", id, () => map.getCanvas().style.cursor = "pointer");
+            map.on("mouseleave", id, () => map.getCanvas().style.cursor = "");
+            map.on("click", id, (e) => {
+              const f = e.features?.[0];
+              const props = f?.properties || {};
+              const keys = Object.keys(props);
+              if (!keys.length) { popup.remove(); return; }
+              const rows = keys.map(k => `<div><b>${escapeHtml(k)}:</b> ${formatVal(props[k])}</div>`).join("");
+              popup.setLngLat(e.lngLat).setHTML(rows).addTo(map);
+            });
+          });
+        }
+
         function bindPointerHandlersOnce() {
           if (HANDLERS_BOUND) return;
           HANDLERS_BOUND = true;
-
           map.on("mousemove", (e) => {
             const pad = 5;
             const box = [[e.point.x - pad, e.point.y - pad],[e.point.x + pad, e.point.y + pad]];
             const feats = HIT_IDS.length ? map.queryRenderedFeatures(box, { layers: HIT_IDS }) : [];
             map.getCanvas().style.cursor = feats.length ? "pointer" : "";
           });
-
           map.on("click", (e) => {
             const pad = 10;
             const box = [[e.point.x - pad, e.point.y - pad],[e.point.x + pad, e.point.y + pad]];
             let feats = HIT_IDS.length ? map.queryRenderedFeatures(box, { layers: HIT_IDS }) : [];
             feats = dedupe(feats);
             if (!feats.length) { popup.remove(); return; }
-
             let html = "";
             feats.slice(0, 10).forEach((f) => {
               const props = f.properties || {};
@@ -207,52 +263,50 @@
             if (!gj) { console.warn("Layer data missing:", key, lyr.path); continue; }
 
             if (map.getSource(srcId)) map.removeSource(srcId);
-            map.addSource(srcId, { type: "geojson", data: gj });
+            map.addSource(srcId, { type: "geojson", data: gj, generateId: true });
 
-            if (isPoint) {
-              const id = `${baseId}-circle`;
-              if (map.getLayer(id)) map.removeLayer(id);
-              map.addLayer({
-                id, type: "circle", source: srcId,
-                paint: {
-                  "circle-radius": 5,
-                  "circle-color": pointColor(i),
-                  "circle-stroke-color": strokeColor(i),
-                  "circle-stroke-width": 1
-                }
-              });
-              map.setLayoutProperty(id, "visibility", "visible");
-              overlayIds.push(id); hitIds.push(id);
-              ensureBasemapBelowOverlays();
-            } else if (isLine) {
-              const id = `${baseId}-line`;
-              if (map.getLayer(id)) map.removeLayer(id);
-              map.addLayer({
-                id, type: "line", source: srcId,
-                paint: { "line-width": 1.5, "line-color": strokeColor(i) }
-              });
-              map.setLayoutProperty(id, "visibility", "visible");
-              overlayIds.push(id); hitIds.push(id);
-              ensureBasemapBelowOverlays();
-            } else {
-              const idFill = `${baseId}-fill`;
-              const idLine = `${baseId}-outline`;
-              if (map.getLayer(idFill)) map.removeLayer(idFill);
-              if (map.getLayer(idLine)) map.removeLayer(idLine);
-              map.addLayer({
-                id: idFill, type: "fill", source: srcId,
-                paint: { "fill-color": fillColor(i), "fill-outline-color": strokeColor(i) }
-              });
-              map.setLayoutProperty(idFill, "visibility", "visible");
-              map.addLayer({
-                id: idLine, type: "line", source: srcId,
-                paint: { "line-width": 1, "line-color": strokeColor(i) }
-              });
-              map.setLayoutProperty(idLine, "visibility", "visible");
-              overlayIds.push(idFill, idLine); hitIds.push(idFill);
-              ensureBasemapBelowOverlays();
-            }
+            const beforeId = firstLabelLayerId();
 
+            const ptsId = `${baseId}-pts`;
+            const lnId  = `${baseId}-line`;
+            const plId  = `${baseId}-fill`;
+
+            if (map.getLayer(ptsId)) map.removeLayer(ptsId);
+            map.addLayer({
+              id: ptsId, type: "circle", source: srcId,
+              filter: ["match", ["geometry-type"], ["Point","MultiPoint"], true, false],
+              paint: {
+                "circle-radius": 5,
+                "circle-color": pointColor(i),
+                "circle-stroke-color": strokeColor(i),
+                "circle-stroke-width": 1
+              }
+            }, beforeId);
+
+            if (map.getLayer(lnId)) map.removeLayer(lnId);
+            map.addLayer({
+              id: lnId, type: "line", source: srcId,
+              filter: ["match", ["geometry-type"], ["LineString","MultiLineString"], true, false],
+              paint: { "line-width": 1.5, "line-color": strokeColor(i) }
+            }, beforeId);
+
+            if (map.getLayer(plId)) map.removeLayer(plId);
+            map.addLayer({
+              id: plId, type: "fill", source: srcId,
+              filter: ["match", ["geometry-type"], ["Polygon","MultiPolygon"], true, false],
+              paint: { "fill-color": fillColor(i), "fill-outline-color": strokeColor(i) }
+            }, beforeId);
+
+            [ptsId, lnId, plId].forEach(id => {
+              try { map.setLayoutProperty(id, "visibility", "visible"); } catch {}
+              hitIds.push(id);
+              overlayIds.push(id);
+            });
+
+            // bind popups directly on these layers
+            bindPopupsAndCursor([ptsId, lnId, plId]);
+
+            // UI row (visual swatch only)
             const row = document.createElement("label");
             const cb  = document.createElement("input");
             cb.type = "checkbox";
@@ -260,7 +314,6 @@
 
             const sw = document.createElement("span");
             sw.className = "swatch";
-
             if (isPoint) {
               sw.style.backgroundColor = pointColor(i);
               sw.style.borderColor     = strokeColor(i);
@@ -287,14 +340,21 @@
             row.classList.remove("dim");
             overlayPanel.appendChild(row);
 
-            if (lyr.bounds && lyr.bounds.length === 4) {
-              const [minx, miny, maxx, maxy] = lyr.bounds;
+            let bArr = isLonLatBounds(lyr.bounds) ? lyr.bounds : bboxFromGeoJSON(gj);
+            if (bArr) {
+              const [minx, miny, maxx, maxy] = bArr;
               const b = new mapboxgl.LngLatBounds([minx, miny], [maxx, maxy]);
               bounds = bounds ? bounds.extend(b) : b;
             }
           }
 
-          if (bounds) map.fitBounds(bounds, { padding: 20, duration: 0 });
+          try {
+            if (bounds && !bounds.isEmpty()) {
+              map.fitBounds(bounds, { padding: 20, duration: 0 });
+            }
+          } catch (e) {
+            console.warn("fitBounds skipped:", e);
+          }
 
           HIT_IDS = hitIds;
           console.log("Hit layers:", HIT_IDS);
@@ -372,7 +432,7 @@
           map.once("style.load", async () => {
             map.jumpTo({ center, zoom, pitch, bearing });
             ensureTerrain();
-            await buildOverlays();     
+            await buildOverlays();    
           });
         }
       })();
